@@ -1,0 +1,333 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shelley Vohr <shelley.vohr@gmail.com>
+Date: Tue, 25 Aug 2020 19:34:12 -0700
+Subject: n-api,src: provide asynchronous cleanup hooks
+
+Backports https://github.com/nodejs/node/pull/34572.
+
+Sometimes addons need to perform cleanup actions, for example
+closing libuv handles or waiting for requests to finish, that
+cannot be performed synchronously.
+
+Add C++ API and N-API functions that allow providing such
+asynchronous cleanup hooks.
+
+This patch can be removed when Electron upgrades to a version of Node.js
+which contains the above referenced commit.
+
+diff --git a/doc/api/addons.md b/doc/api/addons.md
+index 9a2b6d1a5363594bd8a4471668663d609727f398..326422cf14165f321d2aea8554cb3befdb54bb6f 100644
+--- a/doc/api/addons.md
++++ b/doc/api/addons.md
+@@ -234,6 +234,12 @@ NODE_MODULE_INIT(/* exports, module, context */) {
+ ```
+ 
+ #### Worker support
++<!-- YAML
++changes:
++  - version: REPLACEME
++    pr-url: https://github.com/nodejs/node/pull/34572
++    description: Cleanup hooks may now be asynchronous.
++-->
+ 
+ In order to be loaded from multiple Node.js environments,
+ such as a main thread and a Worker thread, an add-on needs to either:
+@@ -256,6 +262,11 @@ down. If necessary, such hooks can be removed using
+ `RemoveEnvironmentCleanupHook()` before they are run, which has the same
+ signature. Callbacks are run in last-in first-out order.
+ 
++If necessary, there is an additional pair of `AddEnvironmentCleanupHook()`
++and `RemoveEnvironmentCleanupHook()` overloads, where the cleanup hook takes a
++callback function. This can be used for shutting down asynchronous resources,
++for example any libuv handles registered by the addon.
++
+ The following `addon.cc` uses `AddEnvironmentCleanupHook`:
+ 
+ ```cpp
+diff --git a/doc/api/n-api.md b/doc/api/n-api.md
+index 23262c853fcf41220569db7839b2d7d751764e85..7763802ff6787b2fbd6b968eabdd3a4f246fdd27 100644
+--- a/doc/api/n-api.md
++++ b/doc/api/n-api.md
+@@ -1509,10 +1509,12 @@ and will lead the process to abort.
+ The hooks will be called in reverse order, i.e. the most recently added one
+ will be called first.
+ 
+-Removing this hook can be done by using `napi_remove_env_cleanup_hook`.
++Removing this hook can be done by using [`napi_remove_env_cleanup_hook`][].
+ Typically, that happens when the resource for which this hook was added
+ is being torn down anyway.
+ 
++For asynchronous cleanup, [`napi_add_async_cleanup_hook`][] is available.
++
+ #### napi_remove_env_cleanup_hook
+ <!-- YAML
+ added: v10.2.0
+@@ -1532,6 +1534,52 @@ need to be exact matches.
+ The function must have originally been registered
+ with `napi_add_env_cleanup_hook`, otherwise the process will abort.
+ 
++#### napi_add_async_cleanup_hook
++<!-- YAML
++added: REPLACEME
++-->
++
++> Stability: 1 - Experimental
++
++```c
++NAPI_EXTERN napi_status napi_add_async_cleanup_hook(
++    napi_env env,
++    void (*fun)(void* arg, void(* cb)(void*), void* cbarg),
++    void* arg,
++    napi_async_cleanup_hook_handle* remove_handle);
++```
++
++Registers `fun` as a function to be run with the `arg` parameter once the
++current Node.js environment exits. Unlike [`napi_add_env_cleanup_hook`][],
++the hook is allowed to be asynchronous in this case, and must invoke the passed
++`cb()` function with `cbarg` once all asynchronous activity is finished.
++
++Otherwise, behavior generally matches that of [`napi_add_env_cleanup_hook`][].
++
++If `remove_handle` is not `NULL`, an opaque value will be stored in it
++that must later be passed to [`napi_remove_async_cleanup_hook`][],
++regardless of whether the hook has already been invoked.
++Typically, that happens when the resource for which this hook was added
++is being torn down anyway.
++
++#### napi_remove_async_cleanup_hook
++<!-- YAML
++added: REPLACEME
++-->
++
++> Stability: 1 - Experimental
++
++```c
++NAPI_EXTERN napi_status napi_remove_async_cleanup_hook(
++    napi_env env,
++    napi_async_cleanup_hook_handle remove_handle);
++```
++
++Unregisters the cleanup hook corresponding to `remove_handle`. This will prevent
++the hook from being executed, unless it has already started executing.
++This must be called on any `napi_async_cleanup_hook_handle` value retrieved
++from [`napi_add_async_cleanup_hook`][].
++
+ ## Module registration
+ N-API modules are registered in a manner similar to other modules
+ except that instead of using the `NODE_MODULE` macro the following
+@@ -5425,6 +5473,7 @@ This API may only be called from the main thread.
+ [`Worker`]: worker_threads.html#worker_threads_class_worker
+ [`global`]: globals.html#globals_global
+ [`init` hooks]: async_hooks.html#async_hooks_init_asyncid_type_triggerasyncid_resource
++[`napi_add_async_cleanup_hook`]: #n_api_napi_add_async_cleanup_hook
+ [`napi_add_env_cleanup_hook`]: #n_api_napi_add_env_cleanup_hook
+ [`napi_add_finalizer`]: #n_api_napi_add_finalizer
+ [`napi_async_init`]: #n_api_napi_async_init
+@@ -5461,6 +5510,8 @@ This API may only be called from the main thread.
+ [`napi_queue_async_work`]: #n_api_napi_queue_async_work
+ [`napi_reference_ref`]: #n_api_napi_reference_ref
+ [`napi_reference_unref`]: #n_api_napi_reference_unref
++[`napi_remove_async_cleanup_hook`]: #n_api_napi_remove_async_cleanup_hook
++[`napi_remove_env_cleanup_hook`]: #n_api_napi_remove_env_cleanup_hook
+ [`napi_set_instance_data`]: #n_api_napi_set_instance_data
+ [`napi_set_property`]: #n_api_napi_set_property
+ [`napi_throw_error`]: #n_api_napi_throw_error
+diff --git a/src/api/hooks.cc b/src/api/hooks.cc
+index 037bdda6f41c825dd112b0cc9fca0ebde47c6163..3b16c0350d8a8494202144407664af41d338fe04 100644
+--- a/src/api/hooks.cc
++++ b/src/api/hooks.cc
+@@ -73,8 +73,35 @@ int EmitExit(Environment* env) {
+       .ToChecked();
+ }
+ 
++typedef void (*CleanupHook)(void* arg);
++typedef void (*AsyncCleanupHook)(void* arg, void(*)(void*), void*);
++
++struct AsyncCleanupHookInfo final {
++  Environment* env;
++  AsyncCleanupHook fun;
++  void* arg;
++  bool started = false;
++  // Use a self-reference to make sure the storage is kept alive while the
++  // cleanup hook is registered but not yet finished.
++  std::shared_ptr<AsyncCleanupHookInfo> self;
++};
++
++// Opaque type that is basically an alias for `shared_ptr<AsyncCleanupHookInfo>`
++// (but not publicly so for easier ABI/API changes). In particular,
++// std::shared_ptr does not generally maintain a consistent ABI even on a
++// specific platform.
++struct ACHHandle final {
++  std::shared_ptr<AsyncCleanupHookInfo> info;
++};
++// This is implemented as an operator on a struct because otherwise you can't
++// default-initialize AsyncCleanupHookHandle, because in C++ for a
++// std::unique_ptr to be default-initializable the deleter type also needs
++// to be default-initializable; in particular, function types don't satisfy
++// this.
++void DeleteACHHandle::operator ()(ACHHandle* handle) const { delete handle; }
++
+ void AddEnvironmentCleanupHook(Isolate* isolate,
+-                               void (*fun)(void* arg),
++                               CleanupHook fun,
+                                void* arg) {
+   Environment* env = Environment::GetCurrent(isolate);
+   CHECK_NOT_NULL(env);
+@@ -82,13 +109,50 @@ void AddEnvironmentCleanupHook(Isolate* isolate,
+ }
+ 
+ void RemoveEnvironmentCleanupHook(Isolate* isolate,
+-                                  void (*fun)(void* arg),
++                                  CleanupHook fun,
+                                   void* arg) {
+   Environment* env = Environment::GetCurrent(isolate);
+   CHECK_NOT_NULL(env);
+   env->RemoveCleanupHook(fun, arg);
+ }
+ 
++static void FinishAsyncCleanupHook(void* arg) {
++  AsyncCleanupHookInfo* info = static_cast<AsyncCleanupHookInfo*>(arg);
++  std::shared_ptr<AsyncCleanupHookInfo> keep_alive = info->self;
++
++  info->env->DecreaseWaitingRequestCounter();
++  info->self.reset();
++}
++
++static void RunAsyncCleanupHook(void* arg) {
++  AsyncCleanupHookInfo* info = static_cast<AsyncCleanupHookInfo*>(arg);
++  info->env->IncreaseWaitingRequestCounter();
++  info->started = true;
++  info->fun(info->arg, FinishAsyncCleanupHook, info);
++}
++
++AsyncCleanupHookHandle AddEnvironmentCleanupHook(
++    Isolate* isolate,
++    AsyncCleanupHook fun,
++    void* arg) {
++  Environment* env = Environment::GetCurrent(isolate);
++  CHECK_NOT_NULL(env);
++  auto info = std::make_shared<AsyncCleanupHookInfo>();
++  info->env = env;
++  info->fun = fun;
++  info->arg = arg;
++  info->self = info;
++  env->AddCleanupHook(RunAsyncCleanupHook, info.get());
++  return AsyncCleanupHookHandle(new ACHHandle { info });
++}
++
++void RemoveEnvironmentCleanupHook(
++    AsyncCleanupHookHandle handle) {
++  if (handle->info->started) return;
++  handle->info->self.reset();
++  handle->info->env->RemoveCleanupHook(RunAsyncCleanupHook, handle->info.get());
++}
++
+ async_id AsyncHooksGetExecutionAsyncId(Isolate* isolate) {
+   Environment* env = Environment::GetCurrent(isolate);
+   if (env == nullptr) return -1;
+diff --git a/src/node.h b/src/node.h
+index 60ecc3bd3499c23b297bc11e7f052aede20520c2..4c4e55e338d7b42c36818a45f6b41170c495adde 100644
+--- a/src/node.h
++++ b/src/node.h
+@@ -739,6 +739,20 @@ NODE_EXTERN void RemoveEnvironmentCleanupHook(v8::Isolate* isolate,
+                                               void (*fun)(void* arg),
+                                               void* arg);
+ 
++/* These are async equivalents of the above. After the cleanup hook is invoked,
++ * `cb(cbarg)` *must* be called, and attempting to remove the cleanup hook will
++ * have no effect. */
++struct ACHHandle;
++struct NODE_EXTERN DeleteACHHandle { void operator()(ACHHandle*) const; };
++typedef std::unique_ptr<ACHHandle, DeleteACHHandle> AsyncCleanupHookHandle;
++
++NODE_EXTERN AsyncCleanupHookHandle AddEnvironmentCleanupHook(
++    v8::Isolate* isolate,
++    void (*fun)(void* arg, void (*cb)(void*), void* cbarg),
++    void* arg);
++
++NODE_EXTERN void RemoveEnvironmentCleanupHook(AsyncCleanupHookHandle holder);
++
+ /* Returns the id of the current execution context. If the return value is
+  * zero then no execution has been set. This will happen if the user handles
+  * I/O from native code. */
+diff --git a/src/node_api.cc b/src/node_api.cc
+index fe24eca1b8e2d81fbafd0a1e2da38d957fbaa1c1..a240be02bd85a1e28a802850a45825032865dcb9 100644
+--- a/src/node_api.cc
++++ b/src/node_api.cc
+@@ -507,6 +507,38 @@ napi_status napi_remove_env_cleanup_hook(napi_env env,
+   return napi_ok;
+ }
+ 
++struct napi_async_cleanup_hook_handle__ {
++  node::AsyncCleanupHookHandle handle;
++};
++
++napi_status napi_add_async_cleanup_hook(
++    napi_env env,
++    void (*fun)(void* arg, void(* cb)(void*), void* cbarg),
++    void* arg,
++    napi_async_cleanup_hook_handle* remove_handle) {
++  CHECK_ENV(env);
++  CHECK_ARG(env, fun);
++
++  auto handle = node::AddEnvironmentCleanupHook(env->isolate, fun, arg);
++  if (remove_handle != nullptr) {
++    *remove_handle = new napi_async_cleanup_hook_handle__ { std::move(handle) };
++  }
++
++  return napi_clear_last_error(env);
++}
++
++napi_status napi_remove_async_cleanup_hook(
++    napi_env env,
++    napi_async_cleanup_hook_handle remove_handle) {
++  CHECK_ENV(env);
++  CHECK_ARG(env, remove_handle);
++
++  node::RemoveEnvironmentCleanupHook(std::move(remove_handle->handle));
++  delete remove_handle;
++
++  return napi_clear_last_error(env);
++}
++
+ napi_status napi_fatal_exception(napi_env env, napi_value err) {
+   NAPI_PREAMBLE(env);
+   CHECK_ARG(env, err);
+diff --git a/src/node_api.h b/src/node_api.h
+index 2f1b45572d8130f27492eb6188c1aa611f2e01a3..4f3eb8f2caae6375d5334486d75be76bf912d4e3 100644
+--- a/src/node_api.h
++++ b/src/node_api.h
+@@ -250,6 +250,20 @@ napi_ref_threadsafe_function(napi_env env, napi_threadsafe_function func);
+ 
+ #endif  // NAPI_VERSION >= 4
+ 
++#ifdef NAPI_EXPERIMENTAL
++
++NAPI_EXTERN napi_status napi_add_async_cleanup_hook(
++    napi_env env,
++    void (*fun)(void* arg, void(* cb)(void*), void* cbarg),
++    void* arg,
++    napi_async_cleanup_hook_handle* remove_handle);
++
++NAPI_EXTERN napi_status napi_remove_async_cleanup_hook(
++    napi_env env,
++    napi_async_cleanup_hook_handle remove_handle);
++
++#endif  // NAPI_EXPERIMENTAL
++
+ EXTERN_C_END
+ 
+ #endif  // SRC_NODE_API_H_
+diff --git a/src/node_api_types.h b/src/node_api_types.h
+index 1c9a2b8aa21889c0d29fb02b234ae9698d122c2c..b8711d3eddc408bc239a964528c23d71555a5d72 100644
+--- a/src/node_api_types.h
++++ b/src/node_api_types.h
+@@ -41,4 +41,8 @@ typedef struct {
+   const char* release;
+ } napi_node_version;
+ 
++#ifdef NAPI_EXPERIMENTAL
++typedef struct napi_async_cleanup_hook_handle__* napi_async_cleanup_hook_handle;
++#endif  // NAPI_EXPERIMENTAL
++
+ #endif  // SRC_NODE_API_TYPES_H_
